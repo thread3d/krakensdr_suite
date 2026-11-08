@@ -118,14 +118,10 @@ fi
 # -------------------------------------------------------------- docker daemon
 step "docker daemon"
 
-# The storage driver has to be configured BEFORE the daemon is started, not after:
-# the reason it will not start is that its default (overlay2) needs kernel
-# overlayfs, which this host may not have. Configuring it afterwards can never
-# help, because the script has already exited.
-apply_storage_driver() {
+merge_daemon_json() {
   mkdir -p /etc/docker
   [ -f /etc/docker/daemon.json ] && cp -n /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$STAMP"
-  python3 - "$STORAGE_DRIVER" <<'PYEMBED'
+  python3 - "$@" <<'PYEMBED'
 import json, os, sys
 p = "/etc/docker/daemon.json"
 d = {}
@@ -134,13 +130,17 @@ if os.path.exists(p):
         d = json.load(open(p))
     except Exception:
         d = {}
-d["storage-driver"] = sys.argv[1]
+for kv in sys.argv[1:]:
+    k, v = kv.split("=", 1)
+    d[k] = (v == "true") if v in ("true", "false") else v
 json.dump(d, open(p, "w"), indent=4)
 print("  daemon.json:", json.dumps(d))
 PYEMBED
-  ok "daemon.json requests storage-driver=$STORAGE_DRIVER"
 }
 
+# Start the daemon and wait for it to answer. Reset the failure counter first:
+# after three failed restarts systemd parks the unit in "start request repeated
+# too quickly" and a plain 'systemctl start' can never recover from that.
 start_daemon() {
   systemctl reset-failed docker >/dev/null 2>&1
   systemctl start docker >/dev/null 2>&1
@@ -152,56 +152,75 @@ start_daemon() {
   return 1
 }
 
+# Only THIS attempt's journal lines - dumping the tail unfiltered showed errors
+# from a previous run and sent me chasing the wrong thing entirely.
+attempt_errors() {
+  journalctl -u docker --since "$1" --no-pager 2>/dev/null \
+    | grep -iE "level=error|failed to start daemon|level=warning.*modprobe" || true
+}
+
 if [ -n "$STORAGE_DRIVER" ]; then
   cur=""
   docker info >/dev/null 2>&1 && cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
   if [ "$cur" != "$STORAGE_DRIVER" ]; then
-    apply_storage_driver
+    merge_daemon_json "storage-driver=$STORAGE_DRIVER"
     # Docker will not reuse a /var/lib/docker initialised by another driver.
-    # It has never started successfully here, so anything present is stale -
-    # move it aside rather than delete, and say where it went.
     if [ -d /var/lib/docker ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
       warn "moving /var/lib/docker aside (it belongs to another driver)"
       mv /var/lib/docker "/var/lib/docker.bak-$STAMP" && ok "kept at /var/lib/docker.bak-$STAMP"
     fi
     systemctl stop docker >/dev/null 2>&1
-    if start_daemon; then
-      ok "daemon started with $STORAGE_DRIVER"
-    else
-      bad "daemon will not start with $STORAGE_DRIVER"
-      journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error" | tail -4 | sed 's/^/     /'
-      exit 1
-    fi
   fi
 fi
 
+ATTEMPT_START="$(date '+%Y-%m-%d %H:%M:%S')"
 if docker info >/dev/null 2>&1; then
   ok "daemon reachable"
+elif start_daemon; then
+  ok "daemon started"
 else
-  warn "daemon not reachable - trying to start it"
-  if start_daemon; then
-    ok "daemon started"
+  errs=$(attempt_errors "$ATTEMPT_START")
+
+  # Docker's default bridge networking needs the kernel's netfilter modules. On a
+  # kernel with no modules at all, 'iptables -t nat' cannot even list its tables,
+  # so creating the DOCKER NAT chain fails and the daemon refuses to start. This
+  # compose file uses network_mode: host for every service, so the bridge and its
+  # NAT rules are never used - switching them off is safe here and unblocks the
+  # daemon without a reboot.
+  if printf '%s' "$errs" | grep -qiE "nat chain DOCKER|iptables table .?nat|Table does not exist"; then
+    warn "docker's bridge/NAT networking needs kernel netfilter modules this kernel lacks"
+    warn "this suite uses network_mode: host, so the bridge is never used - disabling it"
+    merge_daemon_json "iptables=false" "bridge=none" || true
+    ok "daemon.json now disables iptables and the default bridge"
+    systemctl stop docker >/dev/null 2>&1
+    ATTEMPT_START="$(date '+%Y-%m-%d %H:%M:%S')"
+    if start_daemon; then
+      ok "daemon started (host networking only)"
+    else
+      errs=$(attempt_errors "$ATTEMPT_START")
+      bad "dockerd still will not start"
+      printf '%s\n' "$errs" | tail -6 | sed 's/^/     /'
+      exit 1
+    fi
   else
     bad "dockerd will not start"
-    echo "  --- last dockerd errors ---"
-    journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error|failed to start daemon" | tail -5 | sed 's/^/     /'
+    echo "  --- this attempt's errors ---"
+    printf '%s\n' "$errs" | tail -6 | sed 's/^/     /'
 
     if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
-      bad "this kernel has no overlayfs, so docker's default overlay2 driver cannot work"
-      echo "  running kernel   : $(uname -r)"
-      echo "  module dirs      : $(ls /lib/modules 2>/dev/null | tr '\n' ' ')"
-      echo "  .ko for running  : $(find "/lib/modules/$(uname -r)" -name '*.ko*' 2>/dev/null | wc -l)"
-      echo "  /boot/Image is   : $(strings /boot/Image 2>/dev/null | grep -m1 -oE 'Linux version [0-9.]+-tegra' | sed 's/Linux version //')"
-      echo
-      info "If /boot/Image is a NEWER kernel than the one running, the box booted an old"
-      info "kernel whose modules are not installed: a reboot fixes it and brings overlayfs"
-      info "(and so overlay2) back."
-      info "Otherwise retry with the vfs driver, which needs no kernel support:"
-      info "  sudo STORAGE_DRIVER=vfs $0 $*"
+      bad "this kernel has no overlayfs, so overlay2 cannot work"
     fi
+    echo "  running kernel   : $(uname -r)"
+    echo "  .ko for running  : $(find "/lib/modules/$(uname -r)" -name '*.ko*' 2>/dev/null | wc -l)"
+    echo "  /boot/Image is   : $(strings /boot/Image 2>/dev/null | grep -m1 -oE 'Linux version [0-9.]+-tegra' | sed 's/Linux version //')"
+    echo
+    info "If /boot/Image is a NEWER kernel than the running one, the box booted an old"
+    info "kernel whose modules are not installed. One reboot fixes every symptom at"
+    info "once - overlayfs for the storage driver, and netfilter for the bridge."
     exit 1
   fi
 fi
+
 info "storage driver: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
 if [ -n "$STORAGE_DRIVER" ]; then
   cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
