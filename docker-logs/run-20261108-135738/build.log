@@ -1,0 +1,6 @@
+time="2026-11-08T13:57:39+01:00" level=warning msg="buildx Docker CLI plugin not found: falling back to the classic builder. BuildKit-only build features (multi-arch, secrets, ssh, additional contexts, ...) will not be available"
+ Image krakensdr:local Building 
+ Image krakensdr:local Building 
+time="2026-11-08T13:57:39+01:00" level=error msg="Can't add file /home/threaded/projects/KrakenSDR/krakensdr_suite/.dockerignore to tar: io: read/write on closed pipe"
+Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?

@@ -25,6 +25,8 @@
 #            8 cores; each job wants ~1 GB RAM)
 #   WHISPER  1 to build Voice-to-Text's whisper.cpp, default 0. It adds roughly
 #            10 minutes to a first build and is not needed for DoA.
+#   STORAGE_DRIVER  force a docker storage driver (e.g. vfs). Unset = daemon default.
+#            overlay2 needs kernel overlayfs; vfs needs nothing but is much slower.
 #   WAIT     seconds to wait after 'up' before reporting, default 120. heimdall
 #            waits up to 45 s for the dongles, then calibrates; kraken_doa waits
 #            up to 300 s for calibration before starting its UI anyway.
@@ -34,6 +36,7 @@
 # chowned to the invoking user so it can be read without root.
 
 set -u
+set -o pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This needs root (it drives the Docker socket)." >&2
@@ -49,6 +52,7 @@ CALLER_HOME="$HOME"
 JOBS="${JOBS:-6}"
 WHISPER="${WHISPER:-0}"
 WAIT="${WAIT:-120}"
+STORAGE_DRIVER="${STORAGE_DRIVER:-}"
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -99,6 +103,73 @@ else
   ok "compose: $(docker compose version 2>/dev/null)"
 fi
 
+# -------------------------------------------------------------- docker daemon
+step "docker daemon"
+# The socket exists whether or not dockerd is alive, so probe the daemon itself.
+if docker info >/dev/null 2>&1; then
+  ok "daemon reachable"
+else
+  warn "daemon not reachable - trying to start it"
+  systemctl start docker >/dev/null 2>&1
+  sleep 4
+  if docker info >/dev/null 2>&1; then
+    ok "daemon started"
+  else
+    bad "dockerd will not start"
+    echo "  --- last dockerd errors ---"
+    journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error|failed to start daemon" | tail -5 | sed 's/^/     /'
+
+    if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+      bad "this kernel has no overlayfs, so docker's default overlay2 driver cannot work"
+      echo "  running kernel : $(uname -r)"
+      echo "  module dirs    : $(ls /lib/modules 2>/dev/null | tr '\n' ' ')"
+      echo "  .ko for running kernel: $(find "/lib/modules/$(uname -r)" -name '*.ko*' 2>/dev/null | wc -l)"
+      echo "  /boot/Image is : $(strings /boot/Image 2>/dev/null | grep -m1 -oE 'Linux version [0-9.]+-tegra' | sed 's/Linux version //')"
+      echo
+      info "If /boot/Image is a NEWER kernel than the one running, the box booted an old"
+      info "kernel whose modules are not installed: a reboot fixes it and brings overlayfs"
+      info "(and so overlay2) back."
+      info "Otherwise re-run with STORAGE_DRIVER=vfs - slower, but needs no kernel support:"
+      info "  sudo STORAGE_DRIVER=vfs $0 $*"
+    fi
+    exit 1
+  fi
+fi
+info "storage driver: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
+
+if [ -n "$STORAGE_DRIVER" ]; then
+  cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
+  if [ "$cur" = "$STORAGE_DRIVER" ]; then
+    ok "already using $STORAGE_DRIVER"
+  else
+    warn "switching storage driver to $STORAGE_DRIVER"
+    mkdir -p /etc/docker
+    [ -f /etc/docker/daemon.json ] && cp -n /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$STAMP"
+    python3 - "$STORAGE_DRIVER" <<'PYEMBED' || echo "  (merge failed - leaving daemon.json alone)"
+import json, os, sys
+p = "/etc/docker/daemon.json"
+d = {}
+if os.path.exists(p):
+    try:
+        d = json.load(open(p))
+    except Exception:
+        d = {}
+d["storage-driver"] = sys.argv[1]
+json.dump(d, open(p, "w"), indent=4)
+print("  daemon.json:", json.dumps(d))
+PYEMBED
+    systemctl restart docker >/dev/null 2>&1
+    sleep 5
+    if docker info >/dev/null 2>&1; then
+      ok "storage driver now: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
+      info "switching drivers cannot see images built under the previous one"
+    else
+      bad "daemon failed to restart with $STORAGE_DRIVER"
+      exit 1
+    fi
+  fi
+fi
+
 # ------------------------------------------------------------------ preflight
 step "preflight"
 dongles=$(lsusb 2>/dev/null | grep -c "0bda:2838")
@@ -129,25 +200,43 @@ for port in 8070 8080 8081; do
     warn "port $port is already in use"
   fi
 done
-ok "usbfs_memory_mb = $(cat /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null || echo '?')"
+# libusb caps total transfer buffers at 16 MB and five RTL2832U streams need more
+# (the V1 DAQ failed with "Failed to submit transfer" until this was raised). The
+# parameter resets on every boot, so set it here rather than remembering.
+usbfs_now=$(cat /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null || echo '?')
+if [ "$usbfs_now" = "0" ]; then
+  ok "usbfs_memory_mb already 0 (unlimited)"
+elif echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null; then
+  ok "usbfs_memory_mb: $usbfs_now -> 0 (unlimited)"
+else
+  warn "could not raise usbfs_memory_mb (still $usbfs_now) — 5 dongles may hit libusb limits"
+fi
 
 # ---------------------------------------------------------------------- actions
 case "$ACTION" in
   build|up)
     step "build image (JOBS=$JOBS WHISPER=$WHISPER)"
     info "first build compiles everything; this can take 10+ minutes"
-    if JOBS="$JOBS" WHISPER="$WHISPER" docker compose build 2>&1 | tee "$OUT/build.log"; then
+    JOBS="$JOBS" WHISPER="$WHISPER" docker compose build > "$OUT/build.log" 2>&1
+    build_rc=$?
+    grep -E "^#[0-9]+ |DONE|ERROR|CANCELED" "$OUT/build.log" | tail -20 | sed 's/^/  /'
+    if [ "$build_rc" -eq 0 ]; then
       ok "image built"
     else
-      bad "build failed — see build.log"
-      tail -25 "$OUT/build.log" | sed 's/^/     /'
+      bad "build failed (exit $build_rc) — see build.log"
+      tail -30 "$OUT/build.log" | sed 's/^/     /'
       exit 1
     fi
     [ "$ACTION" = "build" ] && { step "done"; ok "image built, not started"; exit 0; }
 
     step "start stack"
-    docker compose up -d 2>&1 | tee -a "$OUT/build.log" | sed 's/^/  /'
-    ok "containers started"
+    if docker compose up -d >> "$OUT/build.log" 2>&1; then
+      ok "containers started"
+    else
+      bad "'docker compose up' failed — see build.log"
+      tail -20 "$OUT/build.log" | sed 's/^/     /'
+      exit 1
+    fi
     info "heimdall waits up to 45 s for the dongles, then calibrates;"
     info "kraken_doa waits up to 300 s for calibration before its UI starts anyway."
     info "waiting ${WAIT}s before reporting"
