@@ -105,47 +105,15 @@ fi
 
 # -------------------------------------------------------------- docker daemon
 step "docker daemon"
-# The socket exists whether or not dockerd is alive, so probe the daemon itself.
-if docker info >/dev/null 2>&1; then
-  ok "daemon reachable"
-else
-  warn "daemon not reachable - trying to start it"
-  systemctl start docker >/dev/null 2>&1
-  sleep 4
-  if docker info >/dev/null 2>&1; then
-    ok "daemon started"
-  else
-    bad "dockerd will not start"
-    echo "  --- last dockerd errors ---"
-    journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error|failed to start daemon" | tail -5 | sed 's/^/     /'
 
-    if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
-      bad "this kernel has no overlayfs, so docker's default overlay2 driver cannot work"
-      echo "  running kernel : $(uname -r)"
-      echo "  module dirs    : $(ls /lib/modules 2>/dev/null | tr '\n' ' ')"
-      echo "  .ko for running kernel: $(find "/lib/modules/$(uname -r)" -name '*.ko*' 2>/dev/null | wc -l)"
-      echo "  /boot/Image is : $(strings /boot/Image 2>/dev/null | grep -m1 -oE 'Linux version [0-9.]+-tegra' | sed 's/Linux version //')"
-      echo
-      info "If /boot/Image is a NEWER kernel than the one running, the box booted an old"
-      info "kernel whose modules are not installed: a reboot fixes it and brings overlayfs"
-      info "(and so overlay2) back."
-      info "Otherwise re-run with STORAGE_DRIVER=vfs - slower, but needs no kernel support:"
-      info "  sudo STORAGE_DRIVER=vfs $0 $*"
-    fi
-    exit 1
-  fi
-fi
-info "storage driver: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
-
-if [ -n "$STORAGE_DRIVER" ]; then
-  cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
-  if [ "$cur" = "$STORAGE_DRIVER" ]; then
-    ok "already using $STORAGE_DRIVER"
-  else
-    warn "switching storage driver to $STORAGE_DRIVER"
-    mkdir -p /etc/docker
-    [ -f /etc/docker/daemon.json ] && cp -n /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$STAMP"
-    python3 - "$STORAGE_DRIVER" <<'PYEMBED' || echo "  (merge failed - leaving daemon.json alone)"
+# The storage driver has to be configured BEFORE the daemon is started, not after:
+# the reason it will not start is that its default (overlay2) needs kernel
+# overlayfs, which this host may not have. Configuring it afterwards can never
+# help, because the script has already exited.
+apply_storage_driver() {
+  mkdir -p /etc/docker
+  [ -f /etc/docker/daemon.json ] && cp -n /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$STAMP"
+  python3 - "$STORAGE_DRIVER" <<'PYEMBED'
 import json, os, sys
 p = "/etc/docker/daemon.json"
 d = {}
@@ -158,16 +126,75 @@ d["storage-driver"] = sys.argv[1]
 json.dump(d, open(p, "w"), indent=4)
 print("  daemon.json:", json.dumps(d))
 PYEMBED
-    systemctl restart docker >/dev/null 2>&1
-    sleep 5
-    if docker info >/dev/null 2>&1; then
-      ok "storage driver now: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
-      info "switching drivers cannot see images built under the previous one"
+  ok "daemon.json requests storage-driver=$STORAGE_DRIVER"
+}
+
+start_daemon() {
+  systemctl reset-failed docker >/dev/null 2>&1
+  systemctl start docker >/dev/null 2>&1
+  local i
+  for i in $(seq 1 12); do
+    docker info >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+if [ -n "$STORAGE_DRIVER" ]; then
+  cur=""
+  docker info >/dev/null 2>&1 && cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
+  if [ "$cur" != "$STORAGE_DRIVER" ]; then
+    apply_storage_driver
+    # Docker will not reuse a /var/lib/docker initialised by another driver.
+    # It has never started successfully here, so anything present is stale -
+    # move it aside rather than delete, and say where it went.
+    if [ -d /var/lib/docker ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+      warn "moving /var/lib/docker aside (it belongs to another driver)"
+      mv /var/lib/docker "/var/lib/docker.bak-$STAMP" && ok "kept at /var/lib/docker.bak-$STAMP"
+    fi
+    systemctl stop docker >/dev/null 2>&1
+    if start_daemon; then
+      ok "daemon started with $STORAGE_DRIVER"
     else
-      bad "daemon failed to restart with $STORAGE_DRIVER"
+      bad "daemon will not start with $STORAGE_DRIVER"
+      journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error" | tail -4 | sed 's/^/     /'
       exit 1
     fi
   fi
+fi
+
+if docker info >/dev/null 2>&1; then
+  ok "daemon reachable"
+else
+  warn "daemon not reachable - trying to start it"
+  if start_daemon; then
+    ok "daemon started"
+  else
+    bad "dockerd will not start"
+    echo "  --- last dockerd errors ---"
+    journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=error|failed to start daemon" | tail -5 | sed 's/^/     /'
+
+    if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+      bad "this kernel has no overlayfs, so docker's default overlay2 driver cannot work"
+      echo "  running kernel   : $(uname -r)"
+      echo "  module dirs      : $(ls /lib/modules 2>/dev/null | tr '\n' ' ')"
+      echo "  .ko for running  : $(find "/lib/modules/$(uname -r)" -name '*.ko*' 2>/dev/null | wc -l)"
+      echo "  /boot/Image is   : $(strings /boot/Image 2>/dev/null | grep -m1 -oE 'Linux version [0-9.]+-tegra' | sed 's/Linux version //')"
+      echo
+      info "If /boot/Image is a NEWER kernel than the one running, the box booted an old"
+      info "kernel whose modules are not installed: a reboot fixes it and brings overlayfs"
+      info "(and so overlay2) back."
+      info "Otherwise retry with the vfs driver, which needs no kernel support:"
+      info "  sudo STORAGE_DRIVER=vfs $0 $*"
+    fi
+    exit 1
+  fi
+fi
+info "storage driver: $(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')"
+if [ -n "$STORAGE_DRIVER" ]; then
+  cur=$(docker info 2>/dev/null | awk -F': ' '/^ Storage Driver/{print $2}')
+  if [ "$cur" = "$STORAGE_DRIVER" ]; then ok "using requested driver $STORAGE_DRIVER"
+  else bad "daemon reports driver '$cur', not '$STORAGE_DRIVER'"; exit 1; fi
 fi
 
 # ------------------------------------------------------------------ preflight
