@@ -103,6 +103,18 @@ else
   ok "compose: $(docker compose version 2>/dev/null)"
 fi
 
+# If the kernel has no overlayfs and no driver was requested, choose vfs rather
+# than failing: the default driver cannot possibly work here, so retrying it just
+# produces the same error. This is what STORAGE_DRIVER=vfs did by hand, now
+# automatic. Say so loudly - it is a real configuration change.
+if [ -z "$STORAGE_DRIVER" ] && ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+  warn "this kernel has no overlayfs, so docker's default overlay2 driver cannot work"
+  warn "falling back to the vfs storage driver automatically (slower; no kernel support needed)"
+  info "to keep trying overlay2 instead, set STORAGE_DRIVER=overlay2 explicitly"
+  info "a reboot onto the newer kernel (/boot/Image) would restore overlayfs and overlay2"
+  STORAGE_DRIVER=vfs
+fi
+
 # -------------------------------------------------------------- docker daemon
 step "docker daemon"
 
