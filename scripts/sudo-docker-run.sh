@@ -274,15 +274,44 @@ fi
 case "$ACTION" in
   build|up)
     step "build image (JOBS=$JOBS WHISPER=$WHISPER)"
-    info "first build compiles everything; this can take 10+ minutes"
-    JOBS="$JOBS" WHISPER="$WHISPER" docker compose build > "$OUT/build.log" 2>&1
-    build_rc=$?
-    grep -E "^#[0-9]+ |DONE|ERROR|CANCELED" "$OUT/build.log" | tail -20 | sed 's/^/  /'
+    info "first build compiles everything; this is the slow part"
+    total_plugins=$(ls -d "$ROOT"/kraken_doa_v2/plugins/*/ 2>/dev/null | wc -l)
+    : > "$OUT/build.log"
+    JOBS="$JOBS" WHISPER="$WHISPER" docker compose build > "$OUT/build.log" 2>&1 &
+    BUILD_PID=$!
+
+    # Stream progress while it runs. Waiting silently for 20+ minutes gives no way
+    # to tell "working" from "wedged", which is the worst part of a slow build.
+    build_start=$(date +%s)
+    last_state=""; last_print=0
+    printf '  %-8s %-12s %-16s %s\n' "elapsed" "step" "plugins" "activity"
+    while kill -0 "$BUILD_PID" 2>/dev/null; do
+      cur_step=$(grep -oE "^Step [0-9]+/[0-9]+" "$OUT/build.log" 2>/dev/null | tail -1)
+      plugins=$(grep -c "built plugin" "$OUT/build.log" 2>/dev/null || true)
+      [ -z "$plugins" ] && plugins=0
+      elapsed=$(( $(date +%s) - build_start ))
+      # docker writes \r-carriage progress sequences; strip them or the columns jitter
+      activity=$(grep -E "^(Compiling |built plugin |Linking |Build complete|Successfully|Removing intermediate)" \
+                   "$OUT/build.log" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-58)
+      state="${cur_step}|${plugins}"
+      now=$(date +%s)
+      # print on any change, and a heartbeat every 20 s so silence never looks like a hang
+      if [ "$state" != "$last_state" ] || [ $((now - last_print)) -ge 20 ]; then
+        printf '  %02d:%02d:%02d %-12s %-16s %s\n' \
+          $((elapsed/3600)) $(( (elapsed%3600)/60 )) $((elapsed%60)) \
+          "${cur_step:-starting}" "${plugins}/${total_plugins}" "$activity"
+        last_state="$state"; last_print=$now
+      fi
+      sleep 3
+    done
+    wait "$BUILD_PID"; build_rc=$?
+
     if [ "$build_rc" -eq 0 ]; then
-      ok "image built"
+      ok "image built in $(( ($(date +%s) - build_start) / 60 )) min"
+      info "build log: $OUT/build.log"
     else
-      bad "build failed (exit $build_rc) — see build.log"
-      tail -30 "$OUT/build.log" | sed 's/^/     /'
+      bad "build failed (exit $build_rc) after $(( ($(date +%s) - build_start) / 60 )) min"
+      tail -30 "$OUT/build.log" | tr '\r' '\n' | sed 's/^/     /'
       exit 1
     fi
     [ "$ACTION" = "build" ] && { step "done"; ok "image built, not started"; exit 0; }
