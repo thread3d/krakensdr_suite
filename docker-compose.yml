@@ -32,6 +32,12 @@ services:
     <<: *common
     build:
       context: .
+      # Build on the host network. The daemon runs with 'bridge: none' and
+      # 'iptables: false' because this kernel has no netfilter modules, which
+      # leaves build containers without a resolver - apt then cannot reach
+      # deb.debian.org. The services themselves already use network_mode: host,
+      # so this changes nothing at runtime.
+      network: host
       args:
         JOBS: ${JOBS:-3}
         # Voice to Text's speech-to-text helper (whisper.cpp): 0 = leave it out
