@@ -70,3 +70,6 @@ etsi_tetra_codec.zip
 en_30039502*.zip
 osmo-tetra/
 mbelib/
+
+# Run bundles written by scripts/sudo-docker-run.sh (artifacts, not source)
+/docker-logs/
