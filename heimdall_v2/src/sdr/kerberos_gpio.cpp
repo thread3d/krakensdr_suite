@@ -1,7 +1,15 @@
 #include "kerberos_gpio.hpp"
 #include "../core/config.hpp"
 
-#ifndef __linux__
+// Linux kernel headers before 5.10 (Ubuntu 20.04's linux-libc-dev, for example)
+// do not declare the GPIO v2 uAPI, so this translation unit would not compile at
+// all. Kerberos switch control is KerberosSDR-only -- a KrakenSDR never calls it --
+// so fall back to the same "unavailable on this platform" stub used off Linux.
+#if defined(__linux__)
+#include <linux/gpio.h>
+#endif
+
+#if !defined(__linux__) || !defined(GPIO_V2_GET_LINE_IOCTL)
 #include <iostream>
 
 // No Raspberry Pi header GPIOs off Linux (a Windows PC has none to drive the
@@ -12,7 +20,8 @@ bool kerberos_gpio_init() {
     std::cerr << "Kerberos switches: Raspberry Pi header GPIOs are not available on this platform (Windows)"
               << std::endl;
 #else
-    std::cerr << "Kerberos switches: Raspberry Pi header GPIOs are not available on this platform" << std::endl;
+    std::cerr << "Kerberos switches: Raspberry Pi header GPIOs are not available on this platform "
+                 "(or the kernel headers lack the GPIO v2 uAPI)" << std::endl;
 #endif
     return false;
 }
